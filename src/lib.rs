@@ -18,6 +18,9 @@ extern crate amplify;
 mod ceremony;
 mod chacha;
 mod hkdf;
+mod handshake;
+
+pub type SymmetricKey = [u8; 32];
 
 #[derive(
     Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Display, Error,
