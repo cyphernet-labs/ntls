@@ -17,6 +17,7 @@ extern crate amplify;
 
 mod ceremony;
 mod chacha;
+mod hkdf;
 
 #[derive(
     Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Display, Error,
