@@ -1,0 +1,13 @@
+[package]
+name = "ntls"
+version = "0.1.0"
+authors = ["Dr. Maxim Orlovsky <orlovsky@lnp-bp.org>"]
+description = "Noise_XK Transport Layer Security protocol implementation"
+repository = "https://github.com/Internet2-WG/ntls"
+keywords = ["internet2", "noise-xk", "privacy", "cryptography"]
+categories = ["network-programming", "cryptography", "encoding"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.59.0"
+
+[dependencies]
