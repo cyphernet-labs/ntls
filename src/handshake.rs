@@ -11,7 +11,7 @@
 // along with this software.
 // If not, see <https://opensource.org/licenses/MIT>.
 
-use ed25519_compact::{PublicKey, SecretKey};
+use ed25519_compact::x25519::{PublicKey, SecretKey};
 use sha2::{Sha256, Digest};
 
 use super::ceremony::{
@@ -31,7 +31,7 @@ macro_rules! concat_then_sha256 {
 		$(
 			sha.update($x);
 		)+
-		sha.finalize().as_ref()
+		*(sha.finalize().as_ref() as &[u8; 32])
 	}}
 }
 
@@ -61,16 +61,17 @@ pub enum HandshakeState {
 // dispatch to all states
 impl HandshakeState {
     pub fn new_initiator(
-        initiator_static_private_key: &SecretKey,
-        responder_static_public_key: &PublicKey,
-        initiator_ephemeral_private_key: &SecretKey,
+        initiator_static_private_key: SecretKey,
+        responder_static_public_key: PublicKey,
+        initiator_ephemeral_private_key: SecretKey,
     ) -> Self {
         HandshakeState::InitiatorStarting(InitiatorStartingState::new(
-            *initiator_static_private_key,
-            *initiator_ephemeral_private_key,
-            *responder_static_public_key,
+            initiator_static_private_key,
+            initiator_ephemeral_private_key,
+            responder_static_public_key,
         ))
     }
+
     pub fn new_responder(
         responder_static_private_key: &SecretKey,
         responder_ephemeral_private_key: &SecretKey,
@@ -170,6 +171,7 @@ pub struct Conduit {
     receiving_key: SymmetricKey,
     chaining_key: SymmetricKey,
     remote_pubkey: PublicKey,
+    buffer: Vec<u8>
 }
 
 impl InitiatorStartingState {
@@ -179,11 +181,13 @@ impl InitiatorStartingState {
         responder_static_public_key: PublicKey,
     ) -> Self {
         let initiator_static_public_key =
-            initiator_static_private_key.public_key();
+            initiator_static_private_key.recover_public_key()
+                .expect("invalid initiator private key");
         let (hash, chaining_key) =
             initialize_handshake_state(&responder_static_public_key);
         let initiator_ephemeral_public_key =
-            initiator_ephemeral_private_key.public_key();
+            initiator_ephemeral_private_key.recover_public_key()
+                .expect("invalid initiator public key");
         InitiatorStartingState {
             initiator_static_private_key,
             initiator_static_public_key,
@@ -250,11 +254,13 @@ impl ResponderAwaitingActOneState {
         responder_ephemeral_private_key: SecretKey,
     ) -> Self {
         let responder_static_public_key =
-            responder_static_private_key.public_key();
+            responder_static_private_key.recover_public_key()
+                .expect("invalid initiator public key");
         let (hash, chaining_key) =
             initialize_handshake_state(&responder_static_public_key);
         let responder_ephemeral_public_key =
-            responder_ephemeral_private_key.public_key();
+            responder_ephemeral_private_key.recover_public_key()
+                .expect("invalid initiator public key");
 
         ResponderAwaitingActOneState {
             responder_static_private_key,
@@ -418,7 +424,7 @@ impl InitiatorAwaitingActTwoState {
         let hash = concat_then_sha256!(hash, &act_three[1..50]);
 
         // 3. se = ECDH(s.priv, re)
-        let ecdh = x25519dh(
+        let ecdh = ecdh(
             initiator_static_private_key,
             responder_ephemeral_public_key,
         );
@@ -444,7 +450,8 @@ impl InitiatorAwaitingActTwoState {
             sending_key,
             receiving_key,
             chaining_key,
-            remote_pubkey: responder_static_public_key
+            remote_pubkey: responder_static_public_key,
+            buffer: vec![]
         };
 
         // 8. Send m = 0 || c || t
@@ -521,7 +528,7 @@ impl ResponderAwaitingActThreeState {
         let hash = concat_then_sha256!(hash, tagged_encrypted_pubkey);
 
         // 6. se = ECDH(e.priv, rs)
-        let ecdh = x25519dh(responder_ephemeral_private_key, initiator_pubkey);
+        let ecdh = ecdh(responder_ephemeral_private_key, initiator_pubkey);
 
         // 7. ck, temp_k3 = HKDF(ck, se)
         let (chaining_key, temporary_key) = hkdf::derive(&chaining_key, &ecdh);
@@ -538,12 +545,11 @@ impl ResponderAwaitingActThreeState {
             sending_key,
             receiving_key,
             chaining_key,
-            remote_pubkey: initiator_pubkey
+            remote_pubkey: initiator_pubkey,
+            // Any remaining data in the read buffer would be encrypted, so transfer
+            // ownership to the Conduit for future use.
+            buffer: input[bytes_read..].to_vec()
         };
-
-        // Any remaining data in the read buffer would be encrypted, so transfer
-        // ownership to the Conduit for future use.
-        conduit.read_buf(&input[bytes_read..]);
 
         Ok((None, HandshakeState::Complete(conduit)))
     }
@@ -564,13 +570,13 @@ fn initialize_handshake_state(
     let chaining_key = concat_then_sha256!(protocol_name);
 
     // 3. h = SHA-256(h || prologue)
-    let hash: &[u8; 32] = concat_then_sha256!(chaining_key, prologue);
+    let hash = concat_then_sha256!(chaining_key, prologue);
 
     // h = SHA-256(h || responderPublicKey)
     let hash =
         concat_then_sha256!(hash, responder_static_public_key.as_slice());
 
-    (*hash, *chaining_key)
+    (hash, chaining_key)
 }
 
 // Due to the very high similarity of acts 1 and 2, this method is used to
@@ -591,7 +597,7 @@ fn calculate_act_message(
 
     // 3. ACT1: es = ECDH(e.priv, rs)
     // 3. ACT2: es = ECDH(e.priv, re)
-    let ecdh = x25519dh(local_private_ephemeral_key, remote_public_key);
+    let ecdh = ecdh(local_private_ephemeral_key, remote_public_key);
 
     // 4. ACT1: ck, temp_k1 = HKDF(ck, es)
     // 4. ACT2: ck, temp_k2 = HKDF(ck, ee)
@@ -608,7 +614,7 @@ fn calculate_act_message(
     act_out[0] = 0;
     act_out[1..34].copy_from_slice(&serialized_local_public_key);
 
-    Ok((*hash, chaining_key, temporary_key))
+    Ok((hash, chaining_key, temporary_key))
 }
 
 // Due to the very high similarity of acts 1 and 2, this method is used to
@@ -653,7 +659,7 @@ fn process_act_message(
 
     // 5. Act1: es = ECDH(s.priv, re)
     // 5. Act2: ee = ECDH(e.priv, ee)
-    let ecdh = x25519dh(local_private_key, ephemeral_public_key);
+    let ecdh = ecdh(local_private_key, ephemeral_public_key);
 
     // 6. Act1: ck, temp_k1 = HKDF(ck, es)
     // 6. Act2: ck, temp_k2 = HKDF(ck, ee)
@@ -666,17 +672,15 @@ fn process_act_message(
     // 8. h = SHA-256(h || c)
     let hash = concat_then_sha256!(hash, chacha_tag);
 
-    Ok((ephemeral_public_key, *hash, chaining_key, temporary_key))
+    Ok((ephemeral_public_key, hash, chaining_key, temporary_key))
 }
 
-fn x25519dh(private_key: SecretKey, public_key: PublicKey) -> SymmetricKey {
-    let pk = ed25519_compact::x25519::PublicKey::new(*public_key);
-    let sk = ed25519_compact::x25519::SecretKey::new(*private_key);
-    let pk_object = pk
+fn ecdh(private_key: SecretKey, public_key: PublicKey) -> SymmetricKey {
+    let pk_object = public_key
         .dh(&private_key)
         .expect("invalid multiplication");
 
-    concat_then_sha256!(pk_object.as_slice()).into_inner()
+    concat_then_sha256!(pk_object.as_slice())
 }
 
 #[cfg(test)]
@@ -701,16 +705,18 @@ mod test {
     impl TestCtx {
         fn new() -> Self {
             let initiator_static_private_key =
-                SecretKey::new([0x_11_u8; 64]);
-            let initiator_public_key = initiator_static_private_key.public_key();
+                SecretKey::new([0x_11_u8; 32]);
+            let initiator_public_key = initiator_static_private_key.recover_public_key()
+                .expect("invalid initiator public key");
             let initiator_ephemeral_private_key =
-                SecretKey::new([0x_12_u8; 64]);
+                SecretKey::new([0x_12_u8; 32]);
 
             let responder_static_private_key =
-                SecretKey::new([0x_21_u8; 64]);
-            let responder_static_public_key = responder_static_private_key.public_key();
+                SecretKey::new([0x_21_u8; 32]);
+            let responder_static_public_key = responder_static_private_key.recover_public_key()
+                .expect("invalid initiator public key");
             let responder_ephemeral_private_key =
-                SecretKey::new([0x_22_u8; 64]);
+                SecretKey::new([0x_22_u8; 32]);
 
             let initiator = InitiatorStartingState::new(
                 initiator_static_private_key,
